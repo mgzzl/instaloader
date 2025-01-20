@@ -1,6 +1,8 @@
 import configparser
 from datetime import datetime, timezone
 from typing import Optional
+from os.path import dirname
+from os import makedirs
 
 
 class LatestStamps:
@@ -16,6 +18,7 @@ class LatestStamps:
     POST_TIMESTAMP = 'post-timestamp'
     TAGGED_TIMESTAMP = 'tagged-timestamp'
     IGTV_TIMESTAMP = 'igtv-timestamp'
+    REELS_TIMESTAMP = 'reels-timestamp'
     STORY_TIMESTAMP = 'story-timestamp'
     ISO_FORMAT = '%Y-%m-%dT%H:%M:%S.%f%z'
 
@@ -25,6 +28,8 @@ class LatestStamps:
         self.data.read(latest_stamps_file)
 
     def _save(self):
+        if dn := dirname(self.file):
+            makedirs(dn, exist_ok=True)
         with open(self.file, 'w') as f:
             self.data.write(f)
 
@@ -82,6 +87,14 @@ class LatestStamps:
     def set_last_tagged_timestamp(self, profile_name: str, timestamp: datetime):
         """Sets timestamp of last download of a profile's tagged posts."""
         self._set_timestamp(profile_name, self.TAGGED_TIMESTAMP, timestamp)
+
+    def get_last_reels_timestamp(self, profile_name: str) -> datetime:
+        """Returns timestamp of last download of a profile's reels posts."""
+        return self._get_timestamp(profile_name, self.REELS_TIMESTAMP)
+
+    def set_last_reels_timestamp(self, profile_name: str, timestamp: datetime):
+        """Sets timestamp of last download of a profile's reels posts."""
+        self._set_timestamp(profile_name, self.REELS_TIMESTAMP, timestamp)
 
     def get_last_igtv_timestamp(self, profile_name: str) -> datetime:
         """Returns timestamp of last download of a profile's igtv posts."""

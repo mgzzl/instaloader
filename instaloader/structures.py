@@ -2,12 +2,11 @@ import json
 import lzma
 import re
 from base64 import b64decode, b64encode
-from collections import namedtuple
 from contextlib import suppress
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple, Union
 from unicodedata import normalize
 
 from . import __version__
@@ -16,31 +15,151 @@ from .instaloadercontext import InstaloaderContext
 from .nodeiterator import FrozenNodeIterator, NodeIterator
 from .sectioniterator import SectionIterator
 
-PostSidecarNode = namedtuple('PostSidecarNode', ['is_video', 'display_url', 'video_url'])
-PostSidecarNode.__doc__ = "Item of a Sidecar Post."
+
+class PostSidecarNode(NamedTuple):
+    """Item of a Sidecar Post."""
+    is_video: bool
+    display_url: str
+    video_url: str
+
+
 PostSidecarNode.is_video.__doc__ = "Whether this node is a video."
 PostSidecarNode.display_url.__doc__ = "URL of image or video thumbnail."
 PostSidecarNode.video_url.__doc__ = "URL of video or None."
 
-PostCommentAnswer = namedtuple('PostCommentAnswer', ['id', 'created_at_utc', 'text', 'owner', 'likes_count'])
+
+class PostCommentAnswer(NamedTuple):
+    id: int
+    created_at_utc: datetime
+    text: str
+    owner: 'Profile'
+    likes_count: int
+
+
 PostCommentAnswer.id.__doc__ = "ID number of comment."
 PostCommentAnswer.created_at_utc.__doc__ = ":class:`~datetime.datetime` when comment was created (UTC)."
 PostCommentAnswer.text.__doc__ = "Comment text."
 PostCommentAnswer.owner.__doc__ = "Owner :class:`Profile` of the comment."
 PostCommentAnswer.likes_count.__doc__ = "Number of likes on comment."
 
-PostComment = namedtuple('PostComment', (*PostCommentAnswer._fields, 'answers')) # type: ignore
-for field in PostCommentAnswer._fields:
-    getattr(PostComment, field).__doc__ = getattr(PostCommentAnswer, field).__doc__  # pylint: disable=no-member
-PostComment.answers.__doc__ = r"Iterator which yields all :class:`PostCommentAnswer`\ s for the comment." # type: ignore
 
-PostLocation = namedtuple('PostLocation', ['id', 'name', 'slug', 'has_public_page', 'lat', 'lng'])
+class PostComment:
+    def __init__(self, context: 'InstaloaderContext', node: Dict[str, Any],
+                 answers: Iterator['PostCommentAnswer'], post: 'Post'):
+        self._context = context
+        self._node = node
+        self._answers = answers
+        self._post = post
+
+    @classmethod
+    def from_iphone_struct(
+        cls,
+        context: "InstaloaderContext",
+        media: Dict[str, Any],
+        answers: Iterator["PostCommentAnswer"],
+        post: "Post",
+    ):
+        return cls(
+            context=context,
+            node={
+                "id": int(media["pk"]),
+                "created_at": media["created_at"],
+                "text": media["text"],
+                "edge_liked_by": {
+                    "count": media["comment_like_count"],
+                },
+                "iphone_struct": media,
+            },
+            answers=answers,
+            post=post,
+        )
+
+    @property
+    def id(self) -> int:
+        """ ID number of comment. """
+        return self._node['id']
+
+    @property
+    def created_at_utc(self) -> datetime:
+        """ :class:`~datetime.datetime` when comment was created (UTC). """
+        return datetime.utcfromtimestamp(self._node['created_at'])
+
+    @property
+    def text(self):
+        """ Comment text. """
+        return self._node['text']
+
+    @property
+    def owner(self) -> "Profile":
+        """ Owner :class:`Profile` of the comment. """
+        if "iphone_struct" in self._node:
+            return Profile.from_iphone_struct(
+                self._context, self._node["iphone_struct"]["user"]
+            )
+        return Profile(self._context, self._node["owner"])
+
+    @property
+    def likes_count(self):
+        """ Number of likes on comment. """
+        return self._node.get('edge_liked_by', {}).get('count', 0)
+
+    @property
+    def answers(self) -> Iterator['PostCommentAnswer']:
+        """ Iterator which yields all :class:`PostCommentAnswer` for the comment. """
+        return self._answers
+
+    @property
+    def likes(self) -> Iterable['Profile']:
+        """
+        Iterate over all likes of a comment. A :class:`Profile` instance of each like is yielded.
+
+        .. versionadded:: 4.11
+        """
+        if self.likes_count != 0:
+            return NodeIterator(
+                self._context,
+                '5f0b1f6281e72053cbc07909c8d154ae',
+                lambda d: d['data']['comment']['edge_liked_by'],
+                lambda n: Profile(self._context, n),
+                {'comment_id': self.id},
+                'https://www.instagram.com/p/{0}/'.format(self._post.shortcode),
+            )
+        return []
+
+    def __repr__(self):
+        return f'<PostComment {self.id} of {self._post.shortcode}>'
+
+class PostLocation(NamedTuple):
+    id: int
+    name: str
+    slug: str
+    has_public_page: Optional[bool]
+    lat: Optional[float]
+    lng: Optional[float]
+
+
 PostLocation.id.__doc__ = "ID number of location."
 PostLocation.name.__doc__ = "Location name."
 PostLocation.slug.__doc__ = "URL friendly variant of location name."
 PostLocation.has_public_page.__doc__ = "Whether location has a public page."
 PostLocation.lat.__doc__ = "Latitude (:class:`float` or None)."
 PostLocation.lng.__doc__ = "Longitude (:class:`float` or None)."
+
+# This regular expression is by MiguelX413
+_hashtag_regex = re.compile(r"(?:#)((?:\w){1,150})")
+
+# This regular expression is modified from jStassen, adjusted to use Python's \w to
+# support Unicode and a word/beginning of string delimiter at the beginning to ensure
+# that no email addresses join the list of mentions.
+# http://blog.jstassen.com/2016/03/code-regex-for-instagram-username-and-hashtags/
+_mention_regex = re.compile(r"(?:^|[^\w\n]|_)(?:@)(\w(?:(?:\w|(?:\.(?!\.))){0,28}(?:\w))?)", re.ASCII)
+
+
+def _optional_normalize(string: Optional[str]) -> Optional[str]:
+    if string is not None:
+        return normalize("NFC", string)
+    else:
+        return None
 
 
 class Post:
@@ -61,7 +180,7 @@ class Post:
     This class unifies access to the properties associated with a post. It implements == and is
     hashable.
 
-    :param context: :attr:`Instaloader.context` used for additional queries if neccessary..
+    :param context: :attr:`Instaloader.context` used for additional queries if necessary..
     :param node: Node structure, as returned by Instagram.
     :param owner_profile: The Profile of the owner, if already known at creation.
     """
@@ -73,8 +192,8 @@ class Post:
         self._context = context
         self._node = node
         self._owner_profile = owner_profile
-        self._full_metadata_dict = None  # type: Optional[Dict[str, Any]]
-        self._location = None            # type: Optional[PostLocation]
+        self._full_metadata_dict: Optional[Dict[str, Any]] = None
+        self._location: Optional[PostLocation] = None
         self._iphone_struct_ = None
         if 'iphone_struct' in node:
             # if loaded from JSON with load_structure_from_file()
@@ -113,20 +232,31 @@ class Post:
             "title": media.get("title"),
             "viewer_has_liked": media["has_liked"],
             "edge_media_preview_like": {"count": media["like_count"]},
+            "accessibility_caption": media.get("accessibility_caption"),
+            "comments": media.get("comment_count"),
             "iphone_struct": media,
         }
         with suppress(KeyError):
             fake_node["display_url"] = media['image_versions2']['candidates'][0]['url']
-        with suppress(KeyError):
+        with suppress(KeyError, TypeError):
             fake_node["video_url"] = media['video_versions'][-1]['url']
             fake_node["video_duration"] = media["video_duration"]
             fake_node["video_view_count"] = media["view_count"]
-        with suppress(KeyError):
-            fake_node["edge_sidecar_to_children"] = {"edges": [{"node": {
-                "display_url": node['image_versions2']['candidates'][0]['url'],
-                "is_video": media_types[node["media_type"]] == "GraphVideo",
-            }} for node in media["carousel_media"]]}
+        with suppress(KeyError, TypeError):
+            fake_node["edge_sidecar_to_children"] = {"edges": [{"node":
+                Post._convert_iphone_carousel(node, media_types)}
+                for node in media["carousel_media"]]}
         return cls(context, fake_node, Profile.from_iphone_struct(context, media["user"]) if "user" in media else None)
+
+    @staticmethod
+    def _convert_iphone_carousel(iphone_node: Dict[str, Any], media_types: Dict[int, str]) -> Dict[str, Any]:
+        fake_node = {
+            "display_url": iphone_node["image_versions2"]["candidates"][0]["url"],
+            "is_video": media_types[iphone_node["media_type"]] == "GraphVideo",
+        }
+        if "video_versions" in iphone_node and iphone_node["video_versions"] is not None:
+            fake_node["video_url"] = iphone_node["video_versions"][0]["url"]
+        return fake_node
 
     @staticmethod
     def shortcode_to_mediaid(code: str) -> int:
@@ -189,13 +319,23 @@ class Post:
 
     def _obtain_metadata(self):
         if not self._full_metadata_dict:
-            pic_json = self._context.graphql_query(
-                '2b0673e0dc4580674a88d426fe00ea90',
-                {'shortcode': self.shortcode}
-            )
-            self._full_metadata_dict = pic_json['data']['shortcode_media']
-            if self._full_metadata_dict is None:
+            pic_json = self._context.doc_id_graphql_query(
+                "8845758582119845", {"shortcode": self.shortcode}
+            )["data"]["xdt_shortcode_media"]
+            if pic_json is None:
                 raise BadResponseException("Fetching Post metadata failed.")
+            try:
+                xdt_types = {
+                    "XDTGraphImage": "GraphImage",
+                    "XDTGraphVideo": "GraphVideo",
+                    "XDTGraphSidecar": "GraphSidecar",
+                }
+                pic_json["__typename"] = xdt_types[pic_json["__typename"]]
+            except KeyError as exc:
+                raise BadResponseException(
+                    f"Unknown __typename in metadata: {pic_json['__typename']}."
+                ) from exc
+            self._full_metadata_dict = pic_json
             if self.shortcode != self._full_metadata_dict['shortcode']:
                 self._node.update(self._full_metadata_dict)
                 raise PostChangedException
@@ -211,7 +351,7 @@ class Post:
         if not self._context.iphone_support:
             raise IPhoneSupportDisabledException("iPhone support is disabled.")
         if not self._context.is_logged_in:
-            raise LoginRequiredException("--login required to access iPhone media info endpoint.")
+            raise LoginRequiredException("Login required to access iPhone media info endpoint.")
         if not self._iphone_struct_:
             data = self._context.get_iphone_json(path='api/v1/media/{}/info/'.format(self.mediaid), params={})
             self._iphone_struct_ = data['items'][0]
@@ -364,39 +504,25 @@ class Post:
     @property
     def caption(self) -> Optional[str]:
         """Caption."""
-        def _normalize(string: Optional[str]) -> Optional[str]:
-            if string is not None:
-                return normalize("NFC", string)
-            else:
-                return None
-
         if "edge_media_to_caption" in self._node and self._node["edge_media_to_caption"]["edges"]:
-            return _normalize(self._node["edge_media_to_caption"]["edges"][0]["node"]["text"])
+            return _optional_normalize(self._node["edge_media_to_caption"]["edges"][0]["node"]["text"])
         elif "caption" in self._node:
-            return _normalize(self._node["caption"])
+            return _optional_normalize(self._node["caption"])
         return None
 
     @property
     def caption_hashtags(self) -> List[str]:
-        """List of all lowercased hashtags (without preceeding #) that occur in the Post's caption."""
+        """List of all lowercased hashtags (without preceding #) that occur in the Post's caption."""
         if not self.caption:
             return []
-        # This regular expression is from jStassen, adjusted to use Python's \w to support Unicode
-        # http://blog.jstassen.com/2016/03/code-regex-for-instagram-username-and-hashtags/
-        hashtag_regex = re.compile(r"(?:#)(\w(?:(?:\w|(?:\.(?!\.))){0,28}(?:\w))?)")
-        return re.findall(hashtag_regex, self.caption.lower())
+        return _hashtag_regex.findall(self.caption.lower())
 
     @property
     def caption_mentions(self) -> List[str]:
-        """List of all lowercased profiles that are mentioned in the Post's caption, without preceeding @."""
+        """List of all lowercased profiles that are mentioned in the Post's caption, without preceding @."""
         if not self.caption:
             return []
-        # This regular expression is modified from jStassen, adjusted to use Python's \w to
-        # support Unicode and a word/beginning of string delimiter at the beginning to ensure
-        # that no email addresses join the list of mentions.
-        # http://blog.jstassen.com/2016/03/code-regex-for-instagram-username-and-hashtags/
-        mention_regex = re.compile(r"(?:^|\W|_)(?:@)(\w(?:(?:\w|(?:\.(?!\.))){0,28}(?:\w))?)", re.ASCII)
-        return re.findall(mention_regex, self.caption.lower())
+        return _mention_regex.findall(self.caption.lower())
 
     @property
     def pcaption(self) -> str:
@@ -512,16 +638,77 @@ class Post:
         except KeyError:
             return self._field('edge_media_to_comment', 'count')
 
-    def get_comments(self) -> Iterable[PostComment]:
-        r"""Iterate over all comments of the post.
+    def _get_comments_via_iphone_endpoint(self) -> Iterable[PostComment]:
+        """
+        Iterate over all comments of the post via an iPhone endpoint.
 
-        Each comment is represented by a PostComment namedtuple with fields text (string), created_at (datetime),
-        id (int), owner (:class:`Profile`) and answers (:class:`~typing.Iterator`\ [:class:`PostCommentAnswer`])
+        .. versionadded:: 4.10.3
+           fallback for :issue:`2125`.
+        """
+        def _query(min_id=None):
+            pagination_params = {"min_id": min_id} if min_id is not None else {}
+            return self._context.get_iphone_json(
+                f"api/v1/media/{self.mediaid}/comments/",
+                {
+                    "can_support_threading": "true",
+                    "permalink_enabled": "false",
+                    **pagination_params,
+                },
+            )
+
+        def _answers(comment_node):
+            def _answer(child_comment):
+                return PostCommentAnswer(
+                    id=int(child_comment["pk"]),
+                    created_at_utc=datetime.utcfromtimestamp(child_comment["created_at"]),
+                    text=child_comment["text"],
+                    owner=Profile.from_iphone_struct(self._context, child_comment["user"]),
+                    likes_count=child_comment["comment_like_count"],
+                )
+
+            child_comment_count = comment_node["child_comment_count"]
+            if child_comment_count == 0:
+                return
+            preview_child_comments = comment_node["preview_child_comments"]
+            if child_comment_count == len(preview_child_comments):
+                yield from (
+                    _answer(child_comment) for child_comment in preview_child_comments
+                )
+                return
+            pk = comment_node["pk"]
+            answers_json = self._context.get_iphone_json(
+                f"api/v1/media/{self.mediaid}/comments/{pk}/child_comments/",
+                {"max_id": ""},
+            )
+            yield from (
+                _answer(child_comment) for child_comment in answers_json["child_comments"]
+            )
+
+        def _paginated_comments(comments_json):
+            for comment_node in comments_json.get("comments", []):
+                yield PostComment.from_iphone_struct(
+                    self._context, comment_node, _answers(comment_node), self
+                )
+
+            next_min_id = comments_json.get("next_min_id")
+            if next_min_id:
+                yield from _paginated_comments(_query(next_min_id))
+
+        return _paginated_comments(_query())
+
+    def get_comments(self) -> Iterable[PostComment]:
+        """Iterate over all comments of the post.
+
+        Each comment is represented by a PostComment NamedTuple with fields text (string), created_at (datetime),
+        id (int), owner (:class:`Profile`) and answers (:class:`~typing.Iterator` [:class:`PostCommentAnswer`])
         if available.
 
         .. versionchanged:: 4.7
            Change return type to ``Iterable``.
         """
+        if not self._context.is_logged_in:
+            raise LoginRequiredException("Login required to access comments of a post.")
+
         def _postcommentanswer(node):
             return PostCommentAnswer(id=int(node['id']),
                                      created_at_utc=datetime.utcfromtimestamp(node['created_at']),
@@ -551,18 +738,28 @@ class Post:
             )
 
         def _postcomment(node):
-            return PostComment(*_postcommentanswer(node),
-                               answers=_postcommentanswers(node))
+            return PostComment(context=self._context, node=node,
+                               answers=_postcommentanswers(node), post=self)
         if self.comments == 0:
             # Avoid doing additional requests if there are no comments
             return []
 
-        comment_edges = self._field('edge_media_to_comment', 'edges')
+        try:
+            comment_edges = self._field("edge_media_to_parent_comment", "edges")
+        except KeyError:
+            comment_edges = self._field("edge_media_to_comment", "edges")
+
         answers_count = sum(edge['node'].get('edge_threaded_comments', {}).get('count', 0) for edge in comment_edges)
 
         if self.comments == len(comment_edges) + answers_count:
             # If the Post's metadata already contains all parent comments, don't do GraphQL requests to obtain them
             return [_postcomment(comment['node']) for comment in comment_edges]
+
+        if self.comments > NodeIterator.page_length():
+            # comments pagination via our graphql query does not work reliably anymore (issue #2125), fallback to an
+            # iphone endpoint if needed.
+            return self._get_comments_via_iphone_endpoint()
+
         return NodeIterator(
             self._context,
             '97b41c52301f77ce508f55e66d17620e',
@@ -580,7 +777,7 @@ class Post:
            Require being logged in (as required by Instagram).
         """
         if not self._context.is_logged_in:
-            raise LoginRequiredException("--login required to access likes of a post.")
+            raise LoginRequiredException("Login required to access likes of a post.")
         if self.likes == 0:
             # Avoid doing additional requests if there are no comments
             return
@@ -625,7 +822,7 @@ class Post:
     @property
     def location(self) -> Optional[PostLocation]:
         """
-        If the Post has a location, returns PostLocation namedtuple with fields 'id', 'lat' and 'lng' and 'name'.
+        If the Post has a location, returns PostLocation NamedTuple with fields 'id', 'lat' and 'lng' and 'name'.
 
         .. versionchanged:: 4.2.9
            Require being logged in (as required by Instagram), return None if not logged-in.
@@ -645,7 +842,11 @@ class Post:
 
     @property
     def is_pinned(self) -> bool:
-        """True if this Post has been pinned by at least one user.
+        """
+        .. deprecated: 4.10.3
+           This information is not returned by IG anymore
+
+        Used to return True if this Post has been pinned by at least one user, now likely returns always false.
 
         .. versionadded: 4.9.2"""
         return 'pinned_for_users' in self._node and bool(self._node['pinned_for_users'])
@@ -681,7 +882,7 @@ class Profile:
     def __init__(self, context: InstaloaderContext, node: Dict[str, Any]):
         assert 'username' in node
         self._context = context
-        self._has_public_story = None  # type: Optional[bool]
+        self._has_public_story: Optional[bool] = None
         self._node = node
         self._has_full_metadata = False
         self._iphone_struct_ = None
@@ -721,8 +922,7 @@ class Profile:
                                       'include_reel': True,
                                       'include_suggested_users': False,
                                       'include_logged_out_extras': False,
-                                      'include_highlight_reels': False},
-                                     rhx_gis=context.root_rhx_gis)['data']['user']
+                                      'include_highlight_reels': False})['data']['user']
         if data:
             profile = cls(context, data['reel']['owner'])
         else:
@@ -753,7 +953,7 @@ class Profile:
 
         .. versionadded:: 4.5.2"""
         if not context.is_logged_in:
-            raise LoginRequiredException("--login required to access own profile.")
+            raise LoginRequiredException("Login required to access own profile.")
         return cls(context, context.graphql_query("d6f4427fbe92d846298cf93df0b937d3", {})["data"]["user"])
 
     def _asdict(self):
@@ -807,7 +1007,7 @@ class Profile:
         if not self._context.iphone_support:
             raise IPhoneSupportDisabledException("iPhone support is disabled.")
         if not self._context.is_logged_in:
-            raise LoginRequiredException("--login required to access iPhone profile info endpoint.")
+            raise LoginRequiredException("Login required to access iPhone profile info endpoint.")
         if not self._iphone_struct_:
             data = self._context.get_iphone_json(path='api/v1/users/{}/info/'.format(self.userid), params={})
             self._iphone_struct_ = data['user']
@@ -874,7 +1074,29 @@ class Profile:
 
     @property
     def biography(self) -> str:
-        return self._metadata('biography')
+        return normalize("NFC", self._metadata('biography'))
+
+    @property
+    def biography_hashtags(self) -> List[str]:
+        """
+        List of all lowercased hashtags (without preceding #) that occur in the Profile's biography.
+
+        .. versionadded:: 4.10
+        """
+        if not self.biography:
+            return []
+        return _hashtag_regex.findall(self.biography.lower())
+
+    @property
+    def biography_mentions(self) -> List[str]:
+        """
+        List of all lowercased profiles that are mentioned in the Profile's biography, without preceding @.
+
+        .. versionadded:: 4.10
+        """
+        if not self.biography:
+            return []
+        return _mention_regex.findall(self.biography.lower())
 
     @property
     def blocked_by_viewer(self) -> bool:
@@ -976,14 +1198,17 @@ class Profile:
         :rtype: NodeIterator[Post]"""
         self._obtain_metadata()
         return NodeIterator(
-            self._context,
-            '003056d32c2554def87228bc3fd9668a',
-            lambda d: d['data']['user']['edge_owner_to_timeline_media'],
-            lambda n: Post(self._context, n, self),
-            {'id': self.userid},
-            'https://www.instagram.com/{0}/'.format(self.username),
-            self._metadata('edge_owner_to_timeline_media'),
-            Profile._make_is_newest_checker()
+            context = self._context,
+            edge_extractor = lambda d: d['data']['xdt_api__v1__feed__user_timeline_graphql_connection'],
+            node_wrapper = lambda n: Post.from_iphone_struct(self._context, n),
+            query_variables = {'data': {
+                'count': 12, 'include_relationship_info': True,
+                'latest_besties_reel_media': True, 'latest_reel_media': True},
+             'username': self.username},
+            query_referer = 'https://www.instagram.com/{0}/'.format(self.username),
+            is_first = Profile._make_is_newest_checker(),
+            doc_id = '7898261790222653',
+            query_hash = None,
         )
 
     def get_saved_posts(self) -> NodeIterator[Post]:
@@ -992,7 +1217,7 @@ class Profile:
         :rtype: NodeIterator[Post]"""
 
         if self.username != self._context.username:
-            raise LoginRequiredException("--login={} required to get that profile's saved posts.".format(self.username))
+            raise LoginRequiredException(f"Login as {self.username} required to get that profile's saved posts.")
 
         return NodeIterator(
             self._context,
@@ -1020,6 +1245,30 @@ class Profile:
             is_first=Profile._make_is_newest_checker()
         )
 
+    def get_reels(self) -> NodeIterator[Post]:
+        """Retrieve all reels from a profile.
+
+        :rtype: NodeIterator[Post]
+
+        .. versionadded:: 4.14.0
+
+        """
+        self._obtain_metadata()
+        return NodeIterator(
+            context = self._context,
+            edge_extractor = lambda d: d['data']['xdt_api__v1__clips__user__connection_v2'],
+            # Reels post info is incomplete relative to regular posts so we create a Post from the shortcode
+            # and fetch the additional metadata with an additional API request per Reel
+            node_wrapper = lambda n: Post.from_shortcode(context=self._context, shortcode=n["media"]["code"]),
+            query_variables = {'data': {
+                'page_size': 12, 'include_feed_video': True, "target_user_id": str(self.userid)}},
+            query_referer = 'https://www.instagram.com/{0}/'.format(self.username),
+            is_first = Profile._make_is_newest_checker(),
+            # fb_api_req_friendly_name=PolarisProfileReelsTabContentQuery_connection
+            doc_id = '7845543455542541',
+            query_hash = None,
+        )
+
     def get_igtv_posts(self) -> NodeIterator[Post]:
         """Retrieve all IGTV posts.
 
@@ -1042,6 +1291,27 @@ class Profile:
     def _make_is_newest_checker() -> Callable[[Post, Optional[Post]], bool]:
         return lambda post, first: first is None or post.date_local > first.date_local
 
+    def get_followed_hashtags(self) -> NodeIterator['Hashtag']:
+        """
+        Retrieve list of hashtags followed by given profile.
+        To use this, one needs to be logged in and private profiles has to be followed.
+
+        :rtype: NodeIterator[Hashtag]
+
+        .. versionadded:: 4.10
+        """
+        if not self._context.is_logged_in:
+            raise LoginRequiredException("Login required to get a profile's followers.")
+        self._obtain_metadata()
+        return NodeIterator(
+            self._context,
+            'e6306cc3dbe69d6a82ef8b5f8654c50b',
+            lambda d: d["data"]["user"]["edge_following_hashtag"],
+            lambda n: Hashtag(self._context, n),
+            {'id': str(self.userid)},
+            'https://www.instagram.com/{0}/'.format(self.username),
+        )
+
     def get_followers(self) -> NodeIterator['Profile']:
         """
         Retrieve list of followers of given profile.
@@ -1050,7 +1320,7 @@ class Profile:
         :rtype: NodeIterator[Profile]
         """
         if not self._context.is_logged_in:
-            raise LoginRequiredException("--login required to get a profile's followers.")
+            raise LoginRequiredException("Login required to get a profile's followers.")
         self._obtain_metadata()
         return NodeIterator(
             self._context,
@@ -1069,7 +1339,7 @@ class Profile:
         :rtype: NodeIterator[Profile]
         """
         if not self._context.is_logged_in:
-            raise LoginRequiredException("--login required to get a profile's followees.")
+            raise LoginRequiredException("Login required to get a profile's followees.")
         self._obtain_metadata()
         return NodeIterator(
             self._context,
@@ -1088,7 +1358,7 @@ class Profile:
         .. versionadded:: 4.4
         """
         if not self._context.is_logged_in:
-            raise LoginRequiredException("--login required to get a profile's similar accounts.")
+            raise LoginRequiredException("Login required to get a profile's similar accounts.")
         self._obtain_metadata()
         yield from (Profile(self._context, edge["node"]) for edge in
                     self._context.graphql_query("ad99dd9d3646cc3c0dda65debcd266a7",
@@ -1167,7 +1437,7 @@ class StoryItem:
         if not self._context.iphone_support:
             raise IPhoneSupportDisabledException("iPhone support is disabled.")
         if not self._context.is_logged_in:
-            raise LoginRequiredException("--login required to access iPhone media info endpoint.")
+            raise LoginRequiredException("Login required to access iPhone media info endpoint.")
         if not self._iphone_struct_:
             data = self._context.get_iphone_json(
                 path='api/v1/feed/reels_media/?reel_ids={}'.format(self.owner_id), params={}
@@ -1249,6 +1519,53 @@ class StoryItem:
         return self._node['__typename']
 
     @property
+    def caption(self) -> Optional[str]:
+        """
+        Caption.
+
+        .. versionadded:: 4.10
+        """
+        if "edge_media_to_caption" in self._node and self._node["edge_media_to_caption"]["edges"]:
+            return _optional_normalize(self._node["edge_media_to_caption"]["edges"][0]["node"]["text"])
+        elif "caption" in self._node:
+            return _optional_normalize(self._node["caption"])
+        return None
+
+    @property
+    def caption_hashtags(self) -> List[str]:
+        """
+        List of all lowercased hashtags (without preceding #) that occur in the StoryItem's caption.
+
+        .. versionadded:: 4.10
+        """
+        if not self.caption:
+            return []
+        return _hashtag_regex.findall(self.caption.lower())
+
+    @property
+    def caption_mentions(self) -> List[str]:
+        """
+        List of all lowercased profiles that are mentioned in the StoryItem's caption, without preceding @.
+
+        .. versionadded:: 4.10
+        """
+        if not self.caption:
+            return []
+        return _mention_regex.findall(self.caption.lower())
+
+    @property
+    def pcaption(self) -> str:
+        """
+        Printable caption, useful as a format specifier for --filename-pattern.
+
+        .. versionadded:: 4.10
+        """
+        def _elliptify(caption):
+            pcaption = ' '.join([s.replace('/', '\u2215') for s in caption.splitlines() if s]).strip()
+            return (pcaption[:30] + "\u2026") if len(pcaption) > 31 else pcaption
+        return _elliptify(self.caption) if self.caption else ''
+
+    @property
     def is_video(self) -> bool:
         """True if the StoryItem is a video."""
         return self._node['is_video']
@@ -1313,9 +1630,9 @@ class Story:
     def __init__(self, context: InstaloaderContext, node: Dict[str, Any]):
         self._context = context
         self._node = node
-        self._unique_id = None      # type: Optional[str]
-        self._owner_profile = None  # type: Optional[Profile]
-        self._iphone_struct_ = None  # type: Optional[Dict[str, Any]]
+        self._unique_id: Optional[str] = None
+        self._owner_profile: Optional[Profile] = None
+        self._iphone_struct_: Optional[Dict[str, Any]] = None
 
     def __repr__(self):
         return '<Story by {} changed {:%Y-%m-%d_%H-%M-%S_UTC}>'.format(self.owner_username, self.latest_media_utc)
@@ -1431,8 +1748,8 @@ class Highlight(Story):
     def __init__(self, context: InstaloaderContext, node: Dict[str, Any], owner: Optional[Profile] = None):
         super().__init__(context, node)
         self._owner_profile = owner
-        self._items = None  # type: Optional[List[Dict[str, Any]]]
-        self._iphone_struct_ = None  # type: Optional[Dict[str, Any]]
+        self._items: Optional[List[Dict[str, Any]]] = None
+        self._iphone_struct_: Optional[Dict[str, Any]] = None
 
     def __repr__(self):
         return '<Highlight by {}: {}>'.format(self.owner_username, self.title)
@@ -1527,11 +1844,11 @@ class Hashtag:
     @classmethod
     def from_name(cls, context: InstaloaderContext, name: str):
         """
-        Create a Hashtag instance from a given hashtag name, without preceeding '#'. Raises an Exception if there is no
+        Create a Hashtag instance from a given hashtag name, without preceding '#'. Raises an Exception if there is no
         hashtag with the given name.
 
         :param context: :attr:`Instaloader.context`
-        :param name: Hashtag, without preceeding '#'
+        :param name: Hashtag, without preceding '#'
         :raises: :class:`QueryReturnedNotFoundException`
         """
         # pylint:disable=protected-access
@@ -1541,7 +1858,7 @@ class Hashtag:
 
     @property
     def name(self):
-        """Hashtag name lowercased, without preceeding '#'"""
+        """Hashtag name lowercased, without preceding '#'"""
         return self._node["name"].lower()
 
     def _query(self, params):
@@ -1868,7 +2185,7 @@ def load_structure(context: InstaloaderContext, json_structure: dict) -> JsonExp
     """Loads a :class:`Post`, :class:`Profile`, :class:`StoryItem`, :class:`Hashtag` or :class:`FrozenNodeIterator` from
     a json structure.
 
-    :param context: :attr:`Instaloader.context` linked to the new object, used for additional queries if neccessary.
+    :param context: :attr:`Instaloader.context` linked to the new object, used for additional queries if necessary.
     :param json_structure: Instaloader JSON structure
 
     .. versionadded:: 4.8
@@ -1898,7 +2215,7 @@ def load_structure_from_file(context: InstaloaderContext, filename: str) -> Json
     """Loads a :class:`Post`, :class:`Profile`, :class:`StoryItem`, :class:`Hashtag` or :class:`FrozenNodeIterator` from
     a '.json' or '.json.xz' file that has been saved by :func:`save_structure_to_file`.
 
-    :param context: :attr:`Instaloader.context` linked to the new object, used for additional queries if neccessary.
+    :param context: :attr:`Instaloader.context` linked to the new object, used for additional queries if necessary.
     :param filename: Filename, ends in '.json' or '.json.xz'
     """
     compressed = filename.endswith('.xz')
